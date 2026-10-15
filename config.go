@@ -18,6 +18,7 @@ const (
 	configName        = "config"
 	localConfigName   = "config.local"
 	stagingName       = "staging"
+	logsName          = "logs"
 	defaultTailLines  = 10000
 	defaultLogPattern = "*.log"
 	// The remote inbox defaults to ~/.rly/inbox/<project dir name>.
@@ -253,6 +254,9 @@ func (c *Config) applyDefaults(p *Project) {
 	if c.StagingDir == "" {
 		c.StagingDir = filepath.Join(p.RlyDir, stagingName)
 	}
+	if c.Logs.Dir == "" {
+		c.Logs.Dir = filepath.Join(p.RlyDir, logsName)
+	}
 	c.StagingDir = p.resolvePath(c.StagingDir)
 	c.Logs.Dir = p.resolvePath(c.Logs.Dir)
 	for i := range c.Snapshots {
@@ -310,9 +314,10 @@ target = ""
 # ssh = "ssh -p 2222"
 
 [logs]
-# Directory your processes tee their output into. Every file matching
-# 'pattern' is tailed into the bundle.
-dir = ""
+# Directory your processes tee their output into, e.g.
+#   ./server 2>&1 | tee .rly/logs/server.log
+# Every file matching 'pattern' is tailed into the bundle.
+# dir = ".rly/logs"   # default; relative to the project root
 pattern = "*.log"
 tail_lines = 10000
 # Names or globs to exclude; "foo" also matches "foo.log".
@@ -334,21 +339,24 @@ skip = []
 # timeout = "2m"
 `
 
-const gitignoreTemplate = `# Managed by rly: bundles and personal overrides stay out of git.
+const gitignoreTemplate = `# Managed by rly: logs, bundles and personal overrides stay out of git.
+/logs/
 /staging/
 /config.local
 `
 
 // initProject creates root/.rly with a config template, a .gitignore and
-// the staging dir. It never overwrites an existing config.
+// the logs and staging dirs. It never overwrites an existing config.
 func initProject(root string) (*Project, error) {
 	p := &Project{Root: root, RlyDir: filepath.Join(root, rlyDirName)}
 	p.ConfigFile = filepath.Join(p.RlyDir, configName)
 	if _, err := os.Stat(p.ConfigFile); err == nil {
 		return p, fmt.Errorf("%s already exists; edit it directly", p.ConfigFile)
 	}
-	if err := os.MkdirAll(filepath.Join(p.RlyDir, stagingName), 0o755); err != nil {
-		return nil, err
+	for _, d := range []string{stagingName, logsName} {
+		if err := os.MkdirAll(filepath.Join(p.RlyDir, d), 0o755); err != nil {
+			return nil, err
+		}
 	}
 	if err := os.WriteFile(p.ConfigFile, []byte(configTemplate), 0o644); err != nil {
 		return nil, err

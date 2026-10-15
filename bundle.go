@@ -4,8 +4,10 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime"
 	"net/http"
 	"os"
@@ -113,7 +115,10 @@ func gatherLogs(cfg *Config, dst string, m *manifest) {
 		m.skip("logs: bad pattern %q: %v", cfg.Logs.Pattern, err)
 		return
 	}
-	if _, err := os.Stat(cfg.Logs.Dir); err != nil {
+	if _, err := os.Stat(cfg.Logs.Dir); errors.Is(err, fs.ErrNotExist) {
+		m.skip("logs: %s does not exist", cfg.Logs.Dir)
+		return
+	} else if err != nil {
 		m.skip("logs: %v", err)
 		return
 	}

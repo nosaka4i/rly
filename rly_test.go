@@ -155,6 +155,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.StagingDir != filepath.Join(p.Root, ".rly", "staging") {
 		t.Errorf("staging = %s", cfg.StagingDir)
 	}
+	if cfg.Logs.Dir != filepath.Join(p.Root, ".rly", "logs") {
+		t.Errorf("logs = %s", cfg.Logs.Dir)
+	}
 	if cfg.Remote.Path != "~/.rly/inbox/"+filepath.Base(p.Root) {
 		t.Errorf("remote path = %s", cfg.Remote.Path)
 	}
@@ -196,10 +199,13 @@ func TestInit(t *testing.T) {
 	if err := run([]string{"init"}); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []string{".rly/config", ".rly/.gitignore", ".rly/staging"} {
+	for _, f := range []string{".rly/config", ".rly/.gitignore", ".rly/staging", ".rly/logs"} {
 		if _, err := os.Stat(filepath.Join(root, f)); err != nil {
 			t.Errorf("init should create %s at the git root: %v", f, err)
 		}
+	}
+	if gi, _ := os.ReadFile(filepath.Join(root, ".rly", ".gitignore")); !strings.Contains(string(gi), "/logs/") {
+		t.Error(".gitignore should exclude logs/")
 	}
 	cfgFile := filepath.Join(root, ".rly", "config")
 	os.WriteFile(cfgFile, []byte("# mine\n"), 0o644)

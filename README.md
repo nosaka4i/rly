@@ -32,7 +32,7 @@ go install github.com/nosaka4i/rly@latest
 cd ~/proj                # any project directory; git not required
 rly init                 # creates .rly/ (at the git root if inside a repo)
 $EDITOR .rly/config      # set remote target, log dir, snapshots; check it in
-./server 2>&1 | tee logs/server.log   # however your processes run
+./server 2>&1 | tee .rly/logs/server.log   # however your processes run
 rly bundle               # bundle + push
 rly push ./test-output.txt   # push one file, timestamp-prefixed
 ```
@@ -43,7 +43,7 @@ rly push ./test-output.txt   # push one file, timestamp-prefixed
 |---|---|
 | `rly bundle` | Gather logs + snapshots, archive into the staging dir, push |
 | `rly push FILE` | Push a single file as `<timestamp>-<name>`; skips all gathering. Works outside a project with `--remote` |
-| `rly init [DIR]` | Create `.rly/` in the project (git root, else current dir, or DIR): config template, `.gitignore`, staging dir |
+| `rly init [DIR]` | Create `.rly/` in the project (git root, else current dir, or DIR): config template, `.gitignore`, logs and staging dirs |
 | `rly config` | Print the resolved configuration |
 
 Running `rly` with no command prints help. Every command takes `--help`.
@@ -60,6 +60,7 @@ Each project directory — a git repo or any other folder — has its own
 .rly/
   config         # what to collect — TOML, checked in
   config.local   # personal overrides (e.g. your ssh alias) — gitignored
+  logs/          # tee your processes' output here — gitignored
   staging/       # bundles land here — gitignored
   .gitignore     # written by `rly init`
 ```
@@ -82,7 +83,7 @@ target = "devbox"            # ssh alias, host, or user@host
 # ssh = "ssh -p 2222"
 
 [logs]
-dir = "logs"                 # relative to the project root; can point elsewhere
+# dir = ".rly/logs"         # default; relative to the project root; can point elsewhere
 pattern = "*.log"
 tail_lines = 10000
 skip = ["ollama"]            # names or globs; "ollama" matches ollama.log
