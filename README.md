@@ -1,6 +1,6 @@
 # rly
 
-Relay log bundles to a centralized location.
+Relay log bundles to a centralized location used for development and test environments.
 
 `rly` snapshots what's happening on one machine (tailed logs, HTTP state
 endpoints, DB backups) into a single timestamped archive and pushes it over
