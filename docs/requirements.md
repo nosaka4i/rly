@@ -39,6 +39,8 @@ present-day agentic coding workflows — not a one-off script.
   whole file — the underlying log files `tee` writes are opened once and
   never rotate, so for a long-running dev process the full file only
   grows. Default-bounded (bash version: 10k lines), overridable per run.
+  *(Superseded 2026-10-15 by incremental bundles + `max_bundle_bytes`;
+  see the amendments under "Decided".)*
 - **Push over existing SSH access**, not a new server/credential — same
   trust boundary the user already has to that machine.
 - **Both a full bundle AND a single-file push mode** — sometimes you
@@ -158,7 +160,37 @@ accumulated local staging directory just to send one new thing.
   directory like git finds `.git`, so subdirectories share one project and
   there is still no silent cwd-dependent guess. `rly init` creates it at the
   git root. Logs from elsewhere (e.g. another repo) are still reachable by
-  pointing `logs.dir` at them.
+  pointing a log source at them.
+- **Amended 2026-10-15: bundles are incremental — zero duplication.** Each
+  `rly bundle` holds only what's new since the previous bundle: log lines
+  appended since then (tracked by byte offset + inode in
+  `.rly/state.json`; truncated/replaced logs are resent from the start),
+  and HTTP/snapshot output only when its hash changed. Nothing new → no
+  bundle. State advances as soon as a bundle is written locally; unpushed
+  bundles (failed push, `--no-push`, no remote) stay pending and are pushed
+  oldest-first on the next run, so every piece of data lives in exactly one
+  bundle. `--full` is the explicit exception (complete snapshot on request).
+- **Amended 2026-10-15: bounded size is a confirm-before-send limit, not
+  tail lines.** With incremental bundles the "last N lines" bound (bash:
+  10k lines) no longer has a job, so it is gone: a log's first bundle,
+  a truncated/replaced log and `--full` all carry the whole file, and every
+  later bundle carries every new line. The bound is now `max_bundle_bytes`
+  (default 50M uncompressed, ~5M gzipped at ~10:1; config, env
+  `RLY_MAX_BUNDLE_BYTES`, `--max-bundle-bytes`), checked for the whole
+  bundle before compressing. Over it, rly asks at a terminal (`[y/N]`) and
+  refuses without one; declining bundles nothing and leaves the state
+  untouched, so nothing is ever silently dropped. `--yes` skips the
+  question; `--full` is never limited.
+- **Amended 2026-10-15: multiple log sources, no forced layout.** The
+  single `[logs] dir`/`pattern` (and its `.rly/logs` default) is replaced
+  by a list of `[[logs]]` sources, each a `path` (file or glob; relative to
+  the project root, `~` expands) with optional `name` (bundle name, files
+  only) and `skip`. There is no default source. A project can tee
+  everything into its own folder (nosaka uses `logs/*.log`) or read logs
+  where tools already keep them (e.g. `~/.ollama/logs/server.log`), or mix
+  both. `--log`/`RLY_LOGS` replace the sources for one run (replacing
+  `--log-dir`/`RLY_LOG_DIR` and `--skip`/`RLY_SKIP_LOGS`). Sent-offsets are
+  keyed by absolute file path, so earlier state carries over unchanged.
 
 ## Open questions for the new session to decide
 

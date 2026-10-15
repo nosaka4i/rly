@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -14,13 +13,12 @@ import (
 )
 
 const (
-	rlyDirName        = ".rly"
-	configName        = "config"
-	localConfigName   = "config.local"
-	stagingName       = "staging"
-	logsName          = "logs"
-	defaultTailLines  = 10000
-	defaultLogPattern = "*.log"
+	rlyDirName      = ".rly"
+	configName      = "config"
+	localConfigName = "config.local"
+	stagingName     = "staging"
+	// Size guard for one bundle's uncompressed data (~5MB gzipped at ~10:1).
+	defaultMaxBundleBytes = 50 << 20
 	// The remote inbox defaults to ~/.rly/inbox/<project dir name>.
 	defaultRemoteBase  = "~/.rly/inbox"
 	defaultHTTPTimeout = 10 * time.Second
@@ -30,11 +28,14 @@ const (
 // Config is the merged shape of .rly/config and .rly/config.local. Env vars
 // and flags only override individual values for one invocation.
 type Config struct {
-	StagingDir string           `toml:"staging_dir"`
-	Remote     RemoteConfig     `toml:"remote"`
-	Logs       LogsConfig       `toml:"logs"`
-	HTTP       []HTTPTarget     `toml:"http"`
-	Snapshots  []SnapshotConfig `toml:"snapshot"`
+	StagingDir string `toml:"staging_dir"`
+	// MaxBundleBytes bounds a bundle's uncompressed size before rly asks
+	// (or, without a terminal, refuses); --full is exempt.
+	MaxBundleBytes ByteSize         `toml:"max_bundle_bytes"`
+	Remote         RemoteConfig     `toml:"remote"`
+	Logs           []LogSource      `toml:"logs"`
+	HTTP           []HTTPTarget     `toml:"http"`
+	Snapshots      []SnapshotConfig `toml:"snapshot"`
 }
 
 type RemoteConfig struct {
@@ -47,12 +48,48 @@ type RemoteConfig struct {
 	SSH string `toml:"ssh"`
 }
 
-type LogsConfig struct {
-	Dir       string   `toml:"dir"`
-	Pattern   string   `toml:"pattern"`
-	TailLines int      `toml:"tail_lines"`
-	Skip      []string `toml:"skip"`
+// LogSource is one [[logs]] entry: a log file or a glob of them, wherever
+// they live. There is no default source.
+type LogSource struct {
+	// Path is a file or a glob; relative paths resolve from the project root.
+	Path string `toml:"path"`
+	// Name is the file's name inside the bundle (logs/<name>); only valid
+	// when Path is a single file. Defaults to the file's base name.
+	Name string `toml:"name,omitempty"`
+	// Skip lists names or globs to exclude; "foo" also matches "foo.log".
+	Skip []string `toml:"skip,omitempty"`
 }
+
+// hasGlobMeta reports whether path contains glob metacharacters.
+func hasGlobMeta(path string) bool {
+	return strings.ContainsAny(path, `*?[`)
+}
+
+// validateLogs checks [[logs]] entries as written in the config.
+func validateLogs(sources []LogSource, file string) error {
+	for i, s := range sources {
+		switch {
+		case s.Path == "":
+			return fmt.Errorf("%s: [[logs]] entry %d has no path", file, i+1)
+		case s.Name == "":
+		case hasGlobMeta(s.Path):
+			return fmt.Errorf("%s: [[logs]] path %q is a glob, so it can't have name %q (name is for a single file)", file, s.Path, s.Name)
+		case s.Name == "." || s.Name == ".." || filepath.Base(s.Name) != s.Name:
+			return fmt.Errorf("%s: [[logs]] name %q must be a plain file name", file, s.Name)
+		}
+	}
+	return nil
+}
+
+const oldLogsFormat = `the [logs] table (dir/pattern/skip) was replaced by a list of log sources; use e.g.
+
+  [[logs]]
+  path = "logs/*.log"       # file or glob, relative to the project root
+  skip = ["noisy"]          # optional
+
+  [[logs]]
+  path = "~/.ollama/logs/server.log"
+  name = "ollama.log"       # optional name inside the bundle`
 
 type HTTPTarget struct {
 	Name    string `toml:"name"`
@@ -70,12 +107,11 @@ type SnapshotConfig struct {
 
 // Overrides holds per-invocation values from flags; empty means "not set".
 type Overrides struct {
-	StagingDir string
-	Remote     string
-	RemotePath string
-	LogDir     string
-	TailLines  string
-	Skip       string
+	StagingDir     string
+	Remote         string
+	RemotePath     string
+	Logs           []string // replaces the configured log sources
+	MaxBundleBytes string
 }
 
 // Project locates a project directory's .rly (a git repo or any folder).
@@ -157,6 +193,11 @@ func loadConfig(p *Project) (*Config, error) {
 	if _, err := toml.DecodeFile(p.localConfigFile(), &local); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("parse %s: %w", p.localConfigFile(), err)
 	}
+	for file, m := range map[string]map[string]any{p.ConfigFile: merged, p.localConfigFile(): local} {
+		if _, old := m["logs"].(map[string]any); old {
+			return nil, fmt.Errorf("%s: %s", file, oldLogsFormat)
+		}
+	}
 	mergeMaps(merged, local)
 
 	var buf strings.Builder
@@ -166,6 +207,9 @@ func loadConfig(p *Project) (*Config, error) {
 	cfg := &Config{}
 	if _, err := toml.Decode(buf.String(), cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", p.ConfigFile, err)
+	}
+	if err := validateLogs(cfg.Logs, p.ConfigFile); err != nil {
+		return nil, err
 	}
 	return cfg, nil
 }
@@ -203,22 +247,34 @@ func (c *Config) applyOverrides(o Overrides) error {
 	set(&c.StagingDir, "RLY_STAGING", o.StagingDir, true)
 	set(&c.Remote.Target, "RLY_REMOTE", o.Remote, false)
 	set(&c.Remote.Path, "RLY_REMOTE_PATH", o.RemotePath, false)
-	set(&c.Logs.Dir, "RLY_LOG_DIR", o.LogDir, true)
 
-	lines := ""
-	set(&lines, "RLY_LOG_TAIL_LINES", o.TailLines, false)
-	if lines != "" {
-		n, err := strconv.Atoi(lines)
-		if err != nil || n <= 0 {
-			return fmt.Errorf("invalid tail line count %q", lines)
+	logs := o.Logs
+	if len(logs) == 0 {
+		// Comma-separated only, so paths may contain spaces.
+		for _, l := range strings.Split(os.Getenv("RLY_LOGS"), ",") {
+			if l = strings.TrimSpace(l); l != "" {
+				logs = append(logs, l)
+			}
 		}
-		c.Logs.TailLines = n
+	}
+	if len(logs) > 0 {
+		c.Logs = nil
+		for _, l := range logs {
+			if abs, err := filepath.Abs(expandHome(l)); err == nil {
+				l = abs
+			}
+			c.Logs = append(c.Logs, LogSource{Path: l})
+		}
 	}
 
-	skip := ""
-	set(&skip, "RLY_SKIP_LOGS", o.Skip, false)
-	if skip != "" {
-		c.Logs.Skip = splitList(skip)
+	maxBundle := ""
+	set(&maxBundle, "RLY_MAX_BUNDLE_BYTES", o.MaxBundleBytes, false)
+	if maxBundle != "" {
+		n, err := parseSize(maxBundle)
+		if err != nil {
+			return fmt.Errorf("max bundle bytes: %w", err)
+		}
+		c.MaxBundleBytes = ByteSize(n)
 	}
 	return nil
 }
@@ -233,11 +289,8 @@ func (p *Project) resolvePath(path string) string {
 }
 
 func (c *Config) applyDefaults(p *Project) {
-	if c.Logs.TailLines <= 0 {
-		c.Logs.TailLines = defaultTailLines
-	}
-	if c.Logs.Pattern == "" {
-		c.Logs.Pattern = defaultLogPattern
+	if c.MaxBundleBytes <= 0 {
+		c.MaxBundleBytes = defaultMaxBundleBytes
 	}
 	if c.Remote.Path == "" {
 		c.Remote.Path = defaultRemoteBase
@@ -254,27 +307,16 @@ func (c *Config) applyDefaults(p *Project) {
 	if c.StagingDir == "" {
 		c.StagingDir = filepath.Join(p.RlyDir, stagingName)
 	}
-	if c.Logs.Dir == "" {
-		c.Logs.Dir = filepath.Join(p.RlyDir, logsName)
-	}
 	c.StagingDir = p.resolvePath(c.StagingDir)
-	c.Logs.Dir = p.resolvePath(c.Logs.Dir)
+	for i := range c.Logs {
+		c.Logs[i].Path = p.resolvePath(c.Logs[i].Path)
+	}
 	for i := range c.Snapshots {
 		if c.Snapshots[i].Dir == "" {
 			c.Snapshots[i].Dir = p.Root
 		}
 		c.Snapshots[i].Dir = p.resolvePath(c.Snapshots[i].Dir)
 	}
-}
-
-func splitList(s string) []string {
-	var out []string
-	for _, p := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' }) {
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
 }
 
 func parseTimeout(s string, def time.Duration) (time.Duration, error) {
@@ -304,6 +346,13 @@ const configTemplate = `# rly project configuration — check this file in.
 # Where bundles are written locally (default: .rly/staging, gitignored).
 # staging_dir = ".rly/staging"
 
+# Size guard. If a bundle's new data (uncompressed) would exceed this, rly
+# asks before sending it — or fails when not run from a terminal; --yes
+# skips the question. --full bundles are never limited. Text logs compress
+# roughly 10:1, so 50M is ~5M on the wire. Accepts "512K", "50M", "1G" or a
+# byte count.
+# max_bundle_bytes = "50M"
+
 [remote]
 # ssh destination: an alias from ~/.ssh/config, host, or user@host.
 # Leave empty to only bundle locally.
@@ -313,15 +362,17 @@ target = ""
 # path = "~/.rly/inbox/myproject"
 # ssh = "ssh -p 2222"
 
-[logs]
-# Directory your processes tee their output into, e.g.
-#   ./server 2>&1 | tee .rly/logs/server.log
-# Every file matching 'pattern' is tailed into the bundle.
-# dir = ".rly/logs"   # default; relative to the project root
-pattern = "*.log"
-tail_lines = 10000
-# Names or globs to exclude; "foo" also matches "foo.log".
-skip = []
+# Log sources: any number of files or globs, wherever the logs live; there
+# is no default. Relative paths resolve from the project root, "~" expands.
+# A log's first bundle (and any --full bundle) carries the whole file, later
+# bundles only the lines added since.
+# [[logs]]
+# path = "logs/*.log"            # e.g. ./server 2>&1 | tee -a logs/server.log
+# skip = ["noisy"]               # optional names/globs; "foo" matches foo.log
+#
+# [[logs]]
+# path = "~/.ollama/logs/server.log"
+# name = "ollama.log"            # optional name inside the bundle (files only)
 
 # Live state snapshots: zero or more named HTTP GET targets.
 # [[http]]
@@ -339,24 +390,22 @@ skip = []
 # timeout = "2m"
 `
 
-const gitignoreTemplate = `# Managed by rly: logs, bundles and personal overrides stay out of git.
-/logs/
+const gitignoreTemplate = `# Managed by rly: bundles, sync state and personal overrides stay out of git.
 /staging/
 /config.local
+/state.json
 `
 
 // initProject creates root/.rly with a config template, a .gitignore and
-// the logs and staging dirs. It never overwrites an existing config.
+// the staging dir. It never overwrites an existing config.
 func initProject(root string) (*Project, error) {
 	p := &Project{Root: root, RlyDir: filepath.Join(root, rlyDirName)}
 	p.ConfigFile = filepath.Join(p.RlyDir, configName)
 	if _, err := os.Stat(p.ConfigFile); err == nil {
 		return p, fmt.Errorf("%s already exists; edit it directly", p.ConfigFile)
 	}
-	for _, d := range []string{stagingName, logsName} {
-		if err := os.MkdirAll(filepath.Join(p.RlyDir, d), 0o755); err != nil {
-			return nil, err
-		}
+	if err := os.MkdirAll(filepath.Join(p.RlyDir, stagingName), 0o755); err != nil {
+		return nil, err
 	}
 	if err := os.WriteFile(p.ConfigFile, []byte(configTemplate), 0o644); err != nil {
 		return nil, err

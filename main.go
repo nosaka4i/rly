@@ -4,10 +4,14 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -36,6 +40,8 @@ type options struct {
 	configFile string
 	o          Overrides
 	noPush     bool
+	full       bool
+	yes        bool
 }
 
 func (opts *options) addRemoteFlags(cmd *cobra.Command) {
@@ -48,9 +54,8 @@ func (opts *options) addBundleFlags(cmd *cobra.Command) {
 	opts.addRemoteFlags(cmd)
 	f := cmd.Flags()
 	f.StringVar(&opts.o.StagingDir, "staging", "", "local staging directory (env RLY_STAGING)")
-	f.StringVar(&opts.o.LogDir, "log-dir", "", "directory of tee'd logs (env RLY_LOG_DIR)")
-	f.StringVar(&opts.o.TailLines, "lines", "", "lines to keep per log (env RLY_LOG_TAIL_LINES)")
-	f.StringVar(&opts.o.Skip, "skip", "", "comma-separated log names/globs to exclude (env RLY_SKIP_LOGS)")
+	f.StringArrayVar(&opts.o.Logs, "log", nil, "log file or glob to bundle instead of the configured [[logs]]; repeatable (env RLY_LOGS, comma-separated)")
+	f.StringVar(&opts.o.MaxBundleBytes, "max-bundle-bytes", "", `ask before bundles larger than this, e.g. "200M" (env RLY_MAX_BUNDLE_BYTES; default 50M)`)
 }
 
 func (opts *options) resolve() (*Config, *Project, error) {
@@ -128,43 +133,151 @@ Precedence: flag > env var > .rly/config.local > .rly/config.`,
 func newBundleCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "bundle",
-		Short: "Gather logs and snapshots into an archive and push it",
-		Args:  cobra.NoArgs,
-		RunE:  func(cmd *cobra.Command, _ []string) error { return runBundle(opts) },
+		Short: "Bundle what's new since the last bundle and push it",
+		Long: `Gather what is new since the previous bundle — appended log lines, and
+HTTP responses or snapshot outputs whose content changed — into one
+timestamped archive in the staging dir, then push it. Nothing new means no
+bundle. Progress is tracked in .rly/state.json; bundles whose push failed
+or was skipped stay pending and are pushed (oldest first) on the next run,
+so each piece of data is sent exactly once. --full sends everything.
+
+A bundle larger than max_bundle_bytes (uncompressed; default 50M) needs
+confirmation: rly asks when run from a terminal and refuses otherwise,
+unless --yes is given. --full bundles are never limited.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error { return runBundle(opts) },
 	}
 	opts.addBundleFlags(cmd)
-	cmd.Flags().BoolVar(&opts.noPush, "no-push", false, "build the bundle locally only")
+	cmd.Flags().BoolVar(&opts.noPush, "no-push", false, "build the bundle locally only (it stays pending for the next push)")
+	cmd.Flags().BoolVar(&opts.full, "full", false, "include everything from the start of each log, with no size limit")
+	cmd.Flags().BoolVarP(&opts.yes, "yes", "y", false, "send a bundle over max_bundle_bytes without asking")
 	return cmd
 }
 
+// nowFunc is swapped in tests to give bundles distinct timestamps.
+var nowFunc = time.Now
+
+// stdinIsTerminal and promptIn are swapped in tests to drive the size
+// prompt without a real terminal.
+var (
+	stdinIsTerminal = func() bool {
+		fi, err := os.Stdin.Stat()
+		return err == nil && fi.Mode()&os.ModeCharDevice != 0
+	}
+	promptIn io.Reader = os.Stdin
+)
+
+// confirmSize returns the over-limit policy for a bundle: --yes proceeds,
+// a terminal gets asked, anything else is refused with a hint.
+func confirmSize(cfg *Config, yes bool) sizeCheck {
+	return func(total int64) error {
+		if yes {
+			return nil
+		}
+		desc := fmt.Sprintf("bundle would be %s (~%s compressed), over max_bundle_bytes %s",
+			formatSize(total), formatSize(total/10), formatSize(int64(cfg.MaxBundleBytes)))
+		if !stdinIsTerminal() {
+			return fmt.Errorf("%s; nothing bundled\nrerun with --yes to send it anyway, raise --max-bundle-bytes, or use --full", desc)
+		}
+		fmt.Fprintf(os.Stderr, "rly: %s; continue? [y/N] ", desc)
+		answer, _ := bufio.NewReader(promptIn).ReadString('\n')
+		switch strings.ToLower(strings.TrimSpace(answer)) {
+		case "y", "yes":
+			return nil
+		}
+		return errAborted
+	}
+}
+
+// runBundle pushes any bundles left pending by earlier failed or skipped
+// pushes, then builds and pushes a bundle of what is new since the last
+// one. State advances as soon as an archive is written, so every byte of
+// data lands in exactly one bundle; unpushed archives stay pending.
 func runBundle(opts *options) error {
-	cfg, _, err := opts.resolve()
+	cfg, p, err := opts.resolve()
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(cfg.StagingDir, 0o755); err != nil {
 		return err
 	}
+	statePath := filepath.Join(p.RlyDir, stateName)
+	st, err := loadState(statePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "rly: warning: %v; treating this as the first bundle\n", err)
+	}
+
+	var pushErr error
+	if !opts.noPush && cfg.Remote.Target != "" {
+		pushErr = pushPending(cfg, st, statePath)
+	}
 
 	fmt.Fprintln(os.Stderr, "rly: bundling")
-	archive, err := buildBundle(cfg, time.Now())
+	archive, ns, err := buildBundle(cfg, st, opts.full, nowFunc(), confirmSize(cfg, opts.yes))
+	if errors.Is(err, errAborted) {
+		fmt.Fprintln(os.Stderr, "rly:", err)
+		return pushErr
+	}
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "rly: wrote", archive)
-
-	if opts.noPush {
-		return nil
-	}
-	if cfg.Remote.Target == "" {
-		fmt.Fprintln(os.Stderr, "rly: no remote target configured; bundle kept locally only")
-		return nil
+	if archive == "" {
+		if err := ns.save(statePath); err != nil {
+			return fmt.Errorf("save state: %w", err)
+		}
+		last := st.LastBundle
+		if last == "" {
+			last = "(no previous bundle)"
+		}
+		fmt.Fprintln(os.Stderr, "rly: nothing new since", last)
+		return pushErr
 	}
 	name := filepath.Base(archive)
+	ns.Pending = append(ns.Pending, name)
+	if err := ns.save(statePath); err != nil {
+		return fmt.Errorf("save state: %w", err)
+	}
+	fmt.Fprintln(os.Stderr, "rly: wrote", archive)
+
+	switch {
+	case pushErr != nil:
+		return fmt.Errorf("%w; %d bundle(s) pending, will retry next run", pushErr, len(ns.Pending))
+	case opts.noPush:
+		fmt.Fprintf(os.Stderr, "rly: not pushed (--no-push); %d bundle(s) pending for the next push\n", len(ns.Pending))
+		return nil
+	case cfg.Remote.Target == "":
+		fmt.Fprintf(os.Stderr, "rly: no remote target configured; %d bundle(s) pending locally\n", len(ns.Pending))
+		return nil
+	}
 	if err := pushFile(cfg, archive, name); err != nil {
-		return fmt.Errorf("%w (bundle kept at %s)", err, archive)
+		return fmt.Errorf("%w (bundle kept at %s; pending, will retry next run)", err, archive)
+	}
+	ns.Pending = slices.DeleteFunc(ns.Pending, func(n string) bool { return n == name })
+	if err := ns.save(statePath); err != nil {
+		return fmt.Errorf("save state: %w", err)
 	}
 	fmt.Fprintln(os.Stderr, "rly: pushed to", remoteDisplay(cfg, name))
+	return nil
+}
+
+// pushPending pushes earlier unpushed bundles oldest first, stopping at the
+// first failure so order is preserved. State is saved after each push.
+func pushPending(cfg *Config, st *State, statePath string) error {
+	for len(st.Pending) > 0 {
+		name := st.Pending[0]
+		archive := filepath.Join(cfg.StagingDir, name)
+		if _, err := os.Stat(archive); err != nil {
+			fmt.Fprintf(os.Stderr, "rly: warning: pending bundle %s is missing from %s; dropping it\n", name, cfg.StagingDir)
+		} else if err := pushFile(cfg, archive, name); err != nil {
+			return fmt.Errorf("pending bundle %s: %w", name, err)
+		} else {
+			fmt.Fprintln(os.Stderr, "rly: pushed pending", remoteDisplay(cfg, name))
+		}
+		st.Pending = st.Pending[1:]
+		if err := st.save(statePath); err != nil {
+			return fmt.Errorf("save state: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -191,7 +304,7 @@ via --remote or RLY_REMOTE.`,
 			if err != nil {
 				return err
 			}
-			name := time.Now().Format(timestampLayout) + "-" + filepath.Base(local)
+			name := nowFunc().Format(timestampLayout) + "-" + filepath.Base(local)
 			if err := pushFile(cfg, local, name); err != nil {
 				return err
 			}

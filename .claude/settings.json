@@ -1,11 +1,15 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git-backlog *)",
+      "Bash(GOOS=darwin GOARCH=arm64 go build -o /dev/null .)",
       "Bash(git backlog *)",
+      "Bash(git-backlog *)",
+      "Bash(go build ./...)",
       "Bash(go test ./...)",
       "Bash(go vet ./...)",
-      "Bash(gofmt -l *)"
+      "Bash(gofmt -l *)",
+      "Bash(gofmt -w *)",
+      "Edit(//home/ubuntu/work/src/github.com/nosaka4i/rly/**)"
     ]
   }
 }
