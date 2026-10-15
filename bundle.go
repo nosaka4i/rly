@@ -255,10 +255,7 @@ func gatherSnapshots(cfg *Config, dst string, m *manifest) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		cmd := exec.CommandContext(ctx, "sh", "-c", command)
-		cmd.Dir = homeDir()
-		if s.Dir != "" {
-			cmd.Dir = expandHome(s.Dir)
-		}
+		cmd.Dir = s.Dir
 		cmd.Env = append(os.Environ(), "RLY_OUT="+outPath)
 		combined, err := cmd.CombinedOutput()
 		cancel()

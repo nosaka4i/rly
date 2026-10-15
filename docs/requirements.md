@@ -150,6 +150,16 @@ accumulated local staging directory just to send one new thing.
   override one setting for one run, but nothing is required to be
   exported for normal day-to-day use.
 
+- **Amended 2026-10-15: config is per repo, not under `~/`.** The
+  `~/.rly/config` decision above is superseded: each repo has its own
+  `.rly/` — `.rly/config` (checked in: what to collect), `.rly/config.local`
+  (gitignored: personal overrides such as the ssh alias), `.rly/staging/`
+  (gitignored: bundles). `rly` finds it by walking up from the working
+  directory like git finds `.git`, so subdirectories share one project and
+  there is still no silent cwd-dependent guess. `rly init` creates it at the
+  git root. Logs from elsewhere (e.g. another repo) are still reachable by
+  pointing `logs.dir` at them.
+
 ## Open questions for the new session to decide
 
 - **Config file format.** `~/.rly/config` as JSON/YAML/TOML — kubectl's

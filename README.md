@@ -29,9 +29,10 @@ go install github.com/nosaka4i/rly@latest
 ## Quick start
 
 ```sh
-rly init                 # creates ~/.rly/staging and ~/.rly/config
-$EDITOR ~/.rly/config    # set remote target, log dir, snapshots
-./server 2>&1 | tee ~/proj/logs/server.log   # however your processes run
+cd ~/proj                # any project directory; git not required
+rly init                 # creates .rly/ (at the git root if inside a repo)
+$EDITOR .rly/config      # set remote target, log dir, snapshots; check it in
+./server 2>&1 | tee logs/server.log   # however your processes run
 rly bundle               # bundle + push
 rly push ./test-output.txt   # push one file, timestamp-prefixed
 ```
@@ -41,8 +42,8 @@ rly push ./test-output.txt   # push one file, timestamp-prefixed
 | Command | |
 |---|---|
 | `rly bundle` | Gather logs + snapshots, archive into the staging dir, push |
-| `rly push FILE` | Push a single file as `<timestamp>-<name>`; skips all gathering |
-| `rly init [DIR]` | Create the staging dir (default `~/.rly/staging`) and save it to the config |
+| `rly push FILE` | Push a single file as `<timestamp>-<name>`; skips all gathering. Works outside a project with `--remote` |
+| `rly init [DIR]` | Create `.rly/` in the project (git root, else current dir, or DIR): config template, `.gitignore`, staging dir |
 | `rly config` | Print the resolved configuration |
 
 Running `rly` with no command prints help. Every command takes `--help`.
@@ -52,21 +53,36 @@ Tab completion: `source <(rly completion bash)` (also `zsh`, `fish`,
 
 ## Configuration
 
-`~/.rly/config` (TOML) is the source of truth. Env vars and flags override
-single values for one run: **flag > env var > config file**. `rly` never
-guesses a staging directory from the working directory — without one it
-tells you to run `rly init`.
+Each project directory — a git repo or any other folder — has its own
+`.rly/` directory:
+
+```
+.rly/
+  config         # what to collect — TOML, checked in
+  config.local   # personal overrides (e.g. your ssh alias) — gitignored
+  staging/       # bundles land here — gitignored
+  .gitignore     # written by `rly init`
+```
+
+`rly` finds it by walking up from the current directory, the way git finds
+`.git`, so running from any subdirectory uses the same project. Relative
+paths in the config are resolved from the project root. Outside a project, `rly`
+tells you to run `rly init`; it never guesses.
+
+Precedence: **flag > env var > `.rly/config.local` > `.rly/config`**.
+`config.local` uses the same keys; tables merge key by key, and arrays
+replace.
 
 ```toml
-staging_dir = "/Users/me/.rly/staging"
+# staging_dir = ".rly/staging"   # default
 
 [remote]
 target = "devbox"            # ssh alias, host, or user@host
-path = "~/.rly/inbox"        # "~/" expands on the remote side
+# path = "~/.rly/inbox/proj" # default: ~/.rly/inbox/<project dir name>
 # ssh = "ssh -p 2222"
 
 [logs]
-dir = "~/proj/logs"
+dir = "logs"                 # relative to the project root; can point elsewhere
 pattern = "*.log"
 tail_lines = 10000
 skip = ["ollama"]            # names or globs; "ollama" matches ollama.log
@@ -79,14 +95,14 @@ timeout = "10s"
 # WAL-safe sqlite backup; {out} is the path the command must write to.
 [[snapshot]]
 name = "db"
-command = "sqlite3 ~/proj/app.db \".backup '{out}'\""
+command = "sqlite3 data/app.db \".backup '{out}'\""
 output = "app.db"
 ```
 
 | Setting | Env var | Flag |
 |---|---|---|
 | config file | `RLY_CONFIG` | `--config` |
-| `staging_dir` | `RLY_HOME` | `--home` |
+| `staging_dir` | `RLY_STAGING` | `--staging` |
 | `remote.target` | `RLY_REMOTE` | `--remote` |
 | `remote.path` | `RLY_REMOTE_PATH` | `--remote-path` |
 | `logs.dir` | `RLY_LOG_DIR` | `--log-dir` |
@@ -106,6 +122,6 @@ configured, the bundle is kept locally and `rly` says so.
   snapshot/<output>
 ```
 
-Snapshot commands run via `sh -c` in `dir` (default: your home directory),
+Snapshot commands run via `sh -c` in `dir` (default: the project root),
 with `{out}` replaced by the shell-quoted output path and `$RLY_OUT` set to
 it.

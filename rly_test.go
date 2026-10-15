@@ -84,65 +84,130 @@ func TestRemoteDirExpr(t *testing.T) {
 	}
 }
 
-func TestPrecedence(t *testing.T) {
-	cfgPath := filepath.Join(t.TempDir(), "config")
-	os.WriteFile(cfgPath, []byte(`
-staging_dir = "/from/file"
-[remote]
-target = "filehost"
-[logs]
-tail_lines = 5
-`), 0o644)
-	t.Setenv("RLY_HOME", "/from/env")
-	t.Setenv("RLY_REMOTE", "envhost")
-	t.Setenv("RLY_LOG_TAIL_LINES", "")
-	cfg, _, err := loadConfig(cfgPath)
+var rlyEnv = []string{"RLY_CONFIG", "RLY_STAGING", "RLY_REMOTE", "RLY_REMOTE_PATH", "RLY_LOG_DIR", "RLY_LOG_TAIL_LINES", "RLY_SKIP_LOGS"}
+
+func clearEnv(t *testing.T) {
+	for _, k := range rlyEnv {
+		t.Setenv(k, "")
+	}
+}
+
+// newProject creates root/.rly with the given config and config.local.
+func newProject(t *testing.T, config, local string) *Project {
+	root := t.TempDir()
+	p, err := initProject(root)
 	if err != nil {
 		t.Fatal(err)
+	}
+	os.WriteFile(p.ConfigFile, []byte(config), 0o644)
+	if local != "" {
+		os.WriteFile(p.localConfigFile(), []byte(local), 0o644)
+	}
+	return p
+}
+
+func TestPrecedence(t *testing.T) {
+	clearEnv(t)
+	p := newProject(t, `
+staging_dir = "out"
+[remote]
+target = "filehost"
+path = "/file/path"
+[logs]
+dir = "logs"
+tail_lines = 5
+skip = ["a", "b"]
+`, `
+[remote]
+target = "localhost"
+[logs]
+skip = ["c"]
+`)
+	t.Setenv("RLY_REMOTE", "envhost")
+	t.Setenv("RLY_STAGING", "/from/env")
+	cfg, err := loadConfig(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Remote.Target != "localhost" || cfg.Remote.Path != "/file/path" || len(cfg.Logs.Skip) != 1 {
+		t.Fatalf("config.local overlay wrong: %+v", cfg)
 	}
 	if err := cfg.applyOverrides(Overrides{Remote: "flaghost"}); err != nil {
 		t.Fatal(err)
 	}
-	cfg.applyDefaults()
+	cfg.applyDefaults(p)
 	if cfg.StagingDir != "/from/env" || cfg.Remote.Target != "flaghost" || cfg.Logs.TailLines != 5 {
 		t.Fatalf("unexpected %+v", cfg)
 	}
-	if cfg.Remote.Path != defaultRemotePath || cfg.Logs.Pattern != "*.log" {
-		t.Fatalf("defaults not applied: %+v", cfg)
+	if cfg.Logs.Dir != filepath.Join(p.Root, "logs") || cfg.Logs.Pattern != "*.log" {
+		t.Fatalf("relative path/defaults wrong: %+v", cfg)
 	}
 }
 
-func TestStagingDirRequired(t *testing.T) {
-	t.Setenv("RLY_HOME", "")
-	t.Setenv("RLY_CONFIG", filepath.Join(t.TempDir(), "missing"))
+func TestDefaults(t *testing.T) {
+	clearEnv(t)
+	p := newProject(t, "", "")
+	cfg, err := loadConfig(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults(p)
+	if cfg.StagingDir != filepath.Join(p.Root, ".rly", "staging") {
+		t.Errorf("staging = %s", cfg.StagingDir)
+	}
+	if cfg.Remote.Path != "~/.rly/inbox/"+filepath.Base(p.Root) {
+		t.Errorf("remote path = %s", cfg.Remote.Path)
+	}
+}
+
+func TestNoProject(t *testing.T) {
+	clearEnv(t)
+	t.Chdir(t.TempDir())
 	err := run([]string{"bundle", "--no-push"})
 	if err == nil || !strings.Contains(err.Error(), "rly init") {
 		t.Fatalf("want init hint, got %v", err)
 	}
 }
 
-func TestInitPreservesConfig(t *testing.T) {
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "sub", "config")
-	if err := writeStagingDir(cfgPath, "/one"); err != nil {
-		t.Fatal(err)
-	}
-	data, _ := os.ReadFile(cfgPath)
-	edited := strings.Replace(string(data), `target = ""`, `target = "box" # mine`, 1)
-	os.WriteFile(cfgPath, []byte(edited), 0o644)
-	if err := writeStagingDir(cfgPath, "/two"); err != nil {
-		t.Fatal(err)
-	}
-	cfg, _, err := loadConfig(cfgPath)
+func TestFindProjectFromSubdir(t *testing.T) {
+	clearEnv(t)
+	p := newProject(t, "", "")
+	sub := filepath.Join(p.Root, "a", "b")
+	os.MkdirAll(sub, 0o755)
+	t.Chdir(sub)
+	got, err := findProject("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.StagingDir != "/two" || cfg.Remote.Target != "box" {
-		t.Fatalf("got %+v", cfg)
+	// Compare resolved paths: TempDir may sit behind a symlink (macOS).
+	want, _ := filepath.EvalSymlinks(p.Root)
+	if have, _ := filepath.EvalSymlinks(got.Root); have != want {
+		t.Fatalf("root = %s, want %s", got.Root, p.Root)
 	}
-	data, _ = os.ReadFile(cfgPath)
-	if !strings.Contains(string(data), "# mine") {
-		t.Fatal("comments lost")
+}
+
+func TestInit(t *testing.T) {
+	clearEnv(t)
+	root := t.TempDir()
+	os.Mkdir(filepath.Join(root, ".git"), 0o755)
+	sub := filepath.Join(root, "pkg")
+	os.Mkdir(sub, 0o755)
+	t.Chdir(sub)
+	if err := run([]string{"init"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{".rly/config", ".rly/.gitignore", ".rly/staging"} {
+		if _, err := os.Stat(filepath.Join(root, f)); err != nil {
+			t.Errorf("init should create %s at the git root: %v", f, err)
+		}
+	}
+	cfgFile := filepath.Join(root, ".rly", "config")
+	os.WriteFile(cfgFile, []byte("# mine\n"), 0o644)
+	if err := run([]string{"init"}); err == nil {
+		t.Fatal("second init should refuse")
+	}
+	if b, _ := os.ReadFile(cfgFile); string(b) != "# mine\n" {
+		t.Fatal("init overwrote existing config")
 	}
 }
 
@@ -158,17 +223,7 @@ func fakeSSH(t *testing.T, remoteHome string) string {
 }
 
 func TestBundleEndToEnd(t *testing.T) {
-	root := t.TempDir()
-	staging := filepath.Join(root, "staging")
-	logs := filepath.Join(root, "logs")
-	remoteHome := filepath.Join(root, "remote")
-	os.MkdirAll(staging, 0o755)
-	os.MkdirAll(logs, 0o755)
-	os.MkdirAll(remoteHome, 0o755)
-	os.WriteFile(filepath.Join(logs, "server.log"), []byte("1\n2\n3\n4\n"), 0o644)
-	os.WriteFile(filepath.Join(logs, "noisy.log"), []byte("x\n"), 0o644)
-	os.WriteFile(filepath.Join(logs, "notes.txt"), []byte("x\n"), 0o644)
-
+	clearEnv(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/broken" {
 			http.Error(w, "nope", 500)
@@ -179,15 +234,13 @@ func TestBundleEndToEnd(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfgPath := filepath.Join(root, "config")
-	os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
-staging_dir = %q
+	remoteHome := t.TempDir()
+	p := newProject(t, fmt.Sprintf(`
 [remote]
 target = "box"
 path = "~/inbox"
-ssh = %q
 [logs]
-dir = %q
+dir = "logs"
 tail_lines = 2
 skip = ["noisy"]
 [[http]]
@@ -201,17 +254,23 @@ name = "down"
 url = "http://127.0.0.1:1/x"
 [[snapshot]]
 name = "db"
-command = "printf dbdata > {out}"
+command = "cat data/app.db > {out}"
 output = "app.db"
 [[snapshot]]
 command = "exit 3"
 output = "fails.db"
-`, staging, fakeSSH(t, remoteHome), logs, srv.URL, srv.URL)), 0o644)
+`, srv.URL, srv.URL), fmt.Sprintf("[remote]\nssh = %q\n", fakeSSH(t, remoteHome)))
+	root := p.Root
+	staging := filepath.Join(p.RlyDir, "staging")
+	logs := filepath.Join(root, "logs")
+	os.MkdirAll(logs, 0o755)
+	os.MkdirAll(filepath.Join(root, "data"), 0o755)
+	os.WriteFile(filepath.Join(root, "data", "app.db"), []byte("dbdata"), 0o644)
+	os.WriteFile(filepath.Join(logs, "server.log"), []byte("1\n2\n3\n4\n"), 0o644)
+	os.WriteFile(filepath.Join(logs, "noisy.log"), []byte("x\n"), 0o644)
+	os.WriteFile(filepath.Join(logs, "notes.txt"), []byte("x\n"), 0o644)
 
-	for _, k := range []string{"RLY_HOME", "RLY_REMOTE", "RLY_REMOTE_PATH", "RLY_LOG_DIR", "RLY_LOG_TAIL_LINES", "RLY_SKIP_LOGS"} {
-		t.Setenv(k, "")
-	}
-	t.Setenv("RLY_CONFIG", cfgPath)
+	t.Chdir(logs) // discovery walks up; relative paths resolve from root
 	if err := run([]string{"bundle"}); err != nil {
 		t.Fatal(err)
 	}
@@ -259,6 +318,9 @@ output = "fails.db"
 		t.Fatal(err)
 	}
 	got, _ := filepath.Glob(filepath.Join(remoteHome, "single", "*-out.txt"))
+	if local, _ := filepath.Glob(filepath.Join(staging, "*-out.txt")); len(local) != 0 {
+		t.Error("single push must not touch staging")
+	}
 	if len(got) != 1 {
 		t.Fatalf("single push: %v", got)
 	}
@@ -294,5 +356,40 @@ func readTarGz(t *testing.T, path string) map[string]string {
 			b, _ := io.ReadAll(tr)
 			out[h.Name] = string(b)
 		}
+	}
+}
+
+func TestInitOutsideGit(t *testing.T) {
+	clearEnv(t)
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := run([]string{"init"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".rly", "config")); err != nil {
+		t.Fatal("init outside git should use the current directory")
+	}
+}
+
+func TestPushWithoutProject(t *testing.T) {
+	clearEnv(t)
+	remoteHome := t.TempDir()
+	dir := t.TempDir()
+	t.Chdir(dir)
+	src := filepath.Join(dir, "out.txt")
+	os.WriteFile(src, []byte("hi"), 0o644)
+
+	if err := run([]string{"push", src}); err == nil || !strings.Contains(err.Error(), "--remote") {
+		t.Fatalf("want hint about --remote, got %v", err)
+	}
+	// No project means no config to name the fake ssh, so put it on PATH.
+	bin := t.TempDir()
+	os.Symlink(fakeSSH(t, remoteHome), filepath.Join(bin, "ssh"))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := run([]string{"push", src, "--remote", "box"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := filepath.Glob(filepath.Join(remoteHome, ".rly", "inbox", "*-out.txt")); len(got) != 1 {
+		t.Fatalf("expected file in ~/.rly/inbox, got %v", got)
 	}
 }

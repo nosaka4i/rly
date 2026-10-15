@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -15,15 +14,20 @@ import (
 )
 
 const (
-	defaultTailLines   = 10000
-	defaultLogPattern  = "*.log"
-	defaultRemotePath  = "~/.rly/inbox"
+	rlyDirName        = ".rly"
+	configName        = "config"
+	localConfigName   = "config.local"
+	stagingName       = "staging"
+	defaultTailLines  = 10000
+	defaultLogPattern = "*.log"
+	// The remote inbox defaults to ~/.rly/inbox/<project dir name>.
+	defaultRemoteBase  = "~/.rly/inbox"
 	defaultHTTPTimeout = 10 * time.Second
 	defaultSnapTimeout = 2 * time.Minute
 )
 
-// Config is the on-disk shape of ~/.rly/config. It is the source of truth;
-// env vars and flags only override individual values for one invocation.
+// Config is the merged shape of .rly/config and .rly/config.local. Env vars
+// and flags only override individual values for one invocation.
 type Config struct {
 	StagingDir string           `toml:"staging_dir"`
 	Remote     RemoteConfig     `toml:"remote"`
@@ -73,23 +77,25 @@ type Overrides struct {
 	Skip       string
 }
 
+// Project locates a project directory's .rly (a git repo or any folder).
+// Relative paths in its config are resolved against Root, never against the
+// working directory.
+type Project struct {
+	Root       string // directory containing .rly
+	RlyDir     string // Root/.rly
+	ConfigFile string // RlyDir/config, or an explicit --config/RLY_CONFIG
+}
+
+func (p *Project) localConfigFile() string {
+	return filepath.Join(filepath.Dir(p.ConfigFile), localConfigName)
+}
+
 func homeDir() string {
 	h, err := os.UserHomeDir()
 	if err != nil {
 		return "."
 	}
 	return h
-}
-
-// configPath resolves which config file to use: flag > RLY_CONFIG > ~/.rly/config.
-func configPath(flagValue string) string {
-	if flagValue != "" {
-		return expandHome(flagValue)
-	}
-	if v := os.Getenv("RLY_CONFIG"); v != "" {
-		return expandHome(v)
-	}
-	return filepath.Join(homeDir(), ".rly", "config")
 }
 
 func expandHome(p string) string {
@@ -102,40 +108,104 @@ func expandHome(p string) string {
 	return p
 }
 
-// loadConfig reads the config file. A missing file yields an empty config;
-// callers decide which missing values are fatal.
-func loadConfig(path string) (*Config, bool, error) {
-	cfg := &Config{}
-	data, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return cfg, false, nil
+var errNoProject = errors.New("not in an rly project")
+
+// findProject resolves the config file: flag > RLY_CONFIG > nearest
+// .rly/config walking up from the working directory, like git finds .git.
+func findProject(flagValue string) (*Project, error) {
+	explicit := flagValue
+	if explicit == "" {
+		explicit = os.Getenv("RLY_CONFIG")
 	}
+	if explicit != "" {
+		cfg, err := filepath.Abs(expandHome(explicit))
+		if err != nil {
+			return nil, err
+		}
+		rlyDir := filepath.Dir(cfg)
+		return &Project{Root: filepath.Dir(rlyDir), RlyDir: rlyDir, ConfigFile: cfg}, nil
+	}
+
+	cwd, err := os.Getwd()
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	if _, err := toml.Decode(string(data), cfg); err != nil {
-		return nil, true, fmt.Errorf("parse %s: %w", path, err)
+	for dir := cwd; ; dir = filepath.Dir(dir) {
+		cfg := filepath.Join(dir, rlyDirName, configName)
+		if st, err := os.Stat(cfg); err == nil && st.Mode().IsRegular() {
+			return &Project{Root: dir, RlyDir: filepath.Join(dir, rlyDirName), ConfigFile: cfg}, nil
+		}
+		if filepath.Dir(dir) == dir {
+			break
+		}
 	}
-	return cfg, true, nil
+	return nil, fmt.Errorf("%w: no %s/%s in %s or any parent directory\nrun `rly init` in your project directory first", errNoProject, rlyDirName, configName, cwd)
 }
 
-// applyOverrides layers env vars, then flags, over the file config.
-func (c *Config) applyOverrides(o Overrides) error {
-	set := func(dst *string, env, flag string) {
-		if v := os.Getenv(env); v != "" {
-			*dst = v
+// loadConfig reads .rly/config and overlays .rly/config.local if present:
+// tables merge key by key, any other value (including arrays) replaces.
+func loadConfig(p *Project) (*Config, error) {
+	merged := map[string]any{}
+	if _, err := toml.DecodeFile(p.ConfigFile, &merged); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("config file %s not found\nrun `rly init` first", p.ConfigFile)
 		}
-		if flag != "" {
-			*dst = flag
-		}
+		return nil, fmt.Errorf("parse %s: %w", p.ConfigFile, err)
 	}
-	set(&c.StagingDir, "RLY_HOME", o.StagingDir)
-	set(&c.Remote.Target, "RLY_REMOTE", o.Remote)
-	set(&c.Remote.Path, "RLY_REMOTE_PATH", o.RemotePath)
-	set(&c.Logs.Dir, "RLY_LOG_DIR", o.LogDir)
+	local := map[string]any{}
+	if _, err := toml.DecodeFile(p.localConfigFile(), &local); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("parse %s: %w", p.localConfigFile(), err)
+	}
+	mergeMaps(merged, local)
+
+	var buf strings.Builder
+	if err := toml.NewEncoder(&buf).Encode(merged); err != nil {
+		return nil, err
+	}
+	cfg := &Config{}
+	if _, err := toml.Decode(buf.String(), cfg); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", p.ConfigFile, err)
+	}
+	return cfg, nil
+}
+
+func mergeMaps(dst, src map[string]any) {
+	for k, v := range src {
+		if sv, ok := v.(map[string]any); ok {
+			if dv, ok := dst[k].(map[string]any); ok {
+				mergeMaps(dv, sv)
+				continue
+			}
+		}
+		dst[k] = v
+	}
+}
+
+// applyOverrides layers env vars, then flags, over the file config. Paths
+// given this way are relative to the working directory, as typed.
+func (c *Config) applyOverrides(o Overrides) error {
+	set := func(dst *string, env, flag string, isPath bool) {
+		v := os.Getenv(env)
+		if flag != "" {
+			v = flag
+		}
+		if v == "" {
+			return
+		}
+		if isPath {
+			if abs, err := filepath.Abs(expandHome(v)); err == nil {
+				v = abs
+			}
+		}
+		*dst = v
+	}
+	set(&c.StagingDir, "RLY_STAGING", o.StagingDir, true)
+	set(&c.Remote.Target, "RLY_REMOTE", o.Remote, false)
+	set(&c.Remote.Path, "RLY_REMOTE_PATH", o.RemotePath, false)
+	set(&c.Logs.Dir, "RLY_LOG_DIR", o.LogDir, true)
 
 	lines := ""
-	set(&lines, "RLY_LOG_TAIL_LINES", o.TailLines)
+	set(&lines, "RLY_LOG_TAIL_LINES", o.TailLines, false)
 	if lines != "" {
 		n, err := strconv.Atoi(lines)
 		if err != nil || n <= 0 {
@@ -145,14 +215,23 @@ func (c *Config) applyOverrides(o Overrides) error {
 	}
 
 	skip := ""
-	set(&skip, "RLY_SKIP_LOGS", o.Skip)
+	set(&skip, "RLY_SKIP_LOGS", o.Skip, false)
 	if skip != "" {
 		c.Logs.Skip = splitList(skip)
 	}
 	return nil
 }
 
-func (c *Config) applyDefaults() {
+// resolvePath expands ~ and anchors relative paths at the project root.
+func (p *Project) resolvePath(path string) string {
+	path = expandHome(path)
+	if path == "" || filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(p.Root, path)
+}
+
+func (c *Config) applyDefaults(p *Project) {
 	if c.Logs.TailLines <= 0 {
 		c.Logs.TailLines = defaultTailLines
 	}
@@ -160,13 +239,28 @@ func (c *Config) applyDefaults() {
 		c.Logs.Pattern = defaultLogPattern
 	}
 	if c.Remote.Path == "" {
-		c.Remote.Path = defaultRemotePath
+		c.Remote.Path = defaultRemoteBase
+		if p != nil {
+			c.Remote.Path += "/" + filepath.Base(p.Root)
+		}
 	}
 	if c.Remote.SSH == "" {
 		c.Remote.SSH = "ssh"
 	}
-	c.StagingDir = expandHome(c.StagingDir)
-	c.Logs.Dir = expandHome(c.Logs.Dir)
+	if p == nil {
+		return // project-less single-file push: nothing below applies
+	}
+	if c.StagingDir == "" {
+		c.StagingDir = filepath.Join(p.RlyDir, stagingName)
+	}
+	c.StagingDir = p.resolvePath(c.StagingDir)
+	c.Logs.Dir = p.resolvePath(c.Logs.Dir)
+	for i := range c.Snapshots {
+		if c.Snapshots[i].Dir == "" {
+			c.Snapshots[i].Dir = p.Root
+		}
+		c.Snapshots[i].Dir = p.resolvePath(c.Snapshots[i].Dir)
+	}
 }
 
 func splitList(s string) []string {
@@ -179,18 +273,6 @@ func splitList(s string) []string {
 	return out
 }
 
-// requireStagingDir enforces the "never silently fall back to cwd" rule.
-func (c *Config) requireStagingDir(cfgPath string) error {
-	if c.StagingDir == "" {
-		return fmt.Errorf("no staging directory configured (looked in %s and $RLY_HOME)\nrun `rly init [DIR]` first", cfgPath)
-	}
-	st, err := os.Stat(c.StagingDir)
-	if err != nil || !st.IsDir() {
-		return fmt.Errorf("staging directory %s does not exist\nrun `rly init %s` to create it", c.StagingDir, c.StagingDir)
-	}
-	return nil
-}
-
 func parseTimeout(s string, def time.Duration) (time.Duration, error) {
 	if s == "" {
 		return def, nil
@@ -198,17 +280,33 @@ func parseTimeout(s string, def time.Duration) (time.Duration, error) {
 	return time.ParseDuration(s)
 }
 
-const configTemplate = `# rly configuration. Env vars (RLY_*) and flags override values here per run.
+// findGitRoot returns the nearest ancestor of dir containing .git, or "".
+func findGitRoot(dir string) string {
+	for d := dir; ; d = filepath.Dir(d) {
+		if _, err := os.Stat(filepath.Join(d, ".git")); err == nil {
+			return d
+		}
+		if filepath.Dir(d) == d {
+			return ""
+		}
+	}
+}
 
-# Local directory where bundles are written. Set by ` + "`rly init`" + `.
-staging_dir = %s
+const configTemplate = `# rly project configuration — check this file in.
+# Personal/machine-specific overrides go in .rly/config.local (gitignored),
+# which uses the same keys. Env vars (RLY_*) and flags override both per run.
+# Relative paths are resolved from the project root (the directory holding .rly).
+
+# Where bundles are written locally (default: .rly/staging, gitignored).
+# staging_dir = ".rly/staging"
 
 [remote]
 # ssh destination: an alias from ~/.ssh/config, host, or user@host.
 # Leave empty to only bundle locally.
 target = ""
 # Directory on the remote side ("~/" is expanded there).
-path = "~/.rly/inbox"
+# Default: ~/.rly/inbox/<project dir name>
+# path = "~/.rly/inbox/myproject"
 # ssh = "ssh -p 2222"
 
 [logs]
@@ -226,41 +324,40 @@ skip = []
 # url = "http://localhost:3000/health"
 # timeout = "10s"
 
-# Snapshot commands, e.g. a WAL-safe sqlite backup. {out} is replaced by the
-# (shell-quoted) path the command must write to; $RLY_OUT holds it as well.
+# Snapshot commands, e.g. a WAL-safe sqlite backup. They run via sh -c from
+# the project root (or 'dir'). {out} is replaced by the shell-quoted path the
+# command must write to; $RLY_OUT holds it as well.
 # [[snapshot]]
 # name = "db"
-# command = "sqlite3 ~/proj/app.db \".backup '{out}'\""
+# command = "sqlite3 data/app.db \".backup '{out}'\""
 # output = "app.db"
 # timeout = "2m"
 `
 
-var stagingLineRe = regexp.MustCompile(`(?m)^[ \t]*staging_dir[ \t]*=.*$`)
+const gitignoreTemplate = `# Managed by rly: bundles and personal overrides stay out of git.
+/staging/
+/config.local
+`
 
-// writeStagingDir persists dir into the config file, creating it from the
-// template if needed and otherwise editing only the staging_dir line so
-// user comments survive.
-func writeStagingDir(cfgPath, dir string) error {
-	quoted := strconv.Quote(dir)
-	data, err := os.ReadFile(cfgPath)
-	var out string
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		out = fmt.Sprintf(configTemplate, quoted)
-	case err != nil:
-		return err
-	case stagingLineRe.Match(data):
-		out = stagingLineRe.ReplaceAllLiteralString(string(data), "staging_dir = "+quoted)
-	default:
-		// Top-level keys must precede any [table], so prepend.
-		out = "staging_dir = " + quoted + "\n" + string(data)
+// initProject creates root/.rly with a config template, a .gitignore and
+// the staging dir. It never overwrites an existing config.
+func initProject(root string) (*Project, error) {
+	p := &Project{Root: root, RlyDir: filepath.Join(root, rlyDirName)}
+	p.ConfigFile = filepath.Join(p.RlyDir, configName)
+	if _, err := os.Stat(p.ConfigFile); err == nil {
+		return p, fmt.Errorf("%s already exists; edit it directly", p.ConfigFile)
 	}
-	var check Config
-	if _, err := toml.Decode(out, &check); err != nil {
-		return fmt.Errorf("refusing to write invalid config %s: %w", cfgPath, err)
+	if err := os.MkdirAll(filepath.Join(p.RlyDir, stagingName), 0o755); err != nil {
+		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
-		return err
+	if err := os.WriteFile(p.ConfigFile, []byte(configTemplate), 0o644); err != nil {
+		return nil, err
 	}
-	return os.WriteFile(cfgPath, []byte(out), 0o644)
+	gi := filepath.Join(p.RlyDir, ".gitignore")
+	if _, err := os.Stat(gi); errors.Is(err, fs.ErrNotExist) {
+		if err := os.WriteFile(gi, []byte(gitignoreTemplate), 0o644); err != nil {
+			return nil, err
+		}
+	}
+	return p, nil
 }
