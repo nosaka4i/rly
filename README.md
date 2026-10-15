@@ -112,6 +112,45 @@ output = "app.db"
 `--no-push` builds the bundle locally only. With no remote target
 configured, the bundle is kept locally and `rly` says so.
 
+## Authentication
+
+`rly` handles no credentials and doesn't use rsync. Each push is one plain
+`ssh` call with the file on stdin:
+
+```sh
+ssh <target> 'mkdir -p <path> && cat > <tmp> && mv <tmp> <final>'
+```
+
+So authentication is whatever `ssh` already does for that target:
+`~/.ssh/config` aliases, `IdentityFile`, `ssh-agent` / the macOS Keychain,
+`ProxyJump`, and so on. To use a different command, set
+`[remote] ssh = "ssh -p 2222"`.
+
+**Recommended: key-based auth**, so pushes never prompt:
+
+```sh
+ssh-keygen -t ed25519        # only if you don't have a key yet
+ssh-copy-id devbox           # installs your public key on the remote
+```
+
+Optionally give the host an alias in `~/.ssh/config`:
+
+```
+Host devbox
+  HostName 203.0.113.10
+  User ubuntu
+  IdentityFile ~/.ssh/id_ed25519
+```
+
+Verify with `ssh devbox true`: if that connects without a password, `rly`
+will too.
+
+**Without a key:** if the server allows password auth, `ssh` prompts on the
+terminal on every run (it reads the password from the tty, not stdin, so
+this works). Many servers and cloud VMs disable password auth, in which case
+the push fails with `Permission denied`. `rly bundle` keeps the bundle
+locally when a push fails.
+
 ## Bundle layout
 
 ```
