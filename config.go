@@ -385,7 +385,7 @@ target = ""
 # command must write to; $RLY_OUT holds it as well.
 # [[snapshot]]
 # name = "db"
-# command = "sqlite3 data/app.db \".backup '{out}'\""
+# command = "sqlite3 data/app.db \".backup {out}\""
 # output = "app.db"
 # timeout = "2m"
 `

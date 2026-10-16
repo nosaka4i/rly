@@ -99,7 +99,7 @@ with the new form in the error message.
    only if its sha256 differs from the last bundle.
 3. **Snapshots**: `sh -c` the command from the project root, with `{out}`
    replaced by the shell-quoted output path (and `$RLY_OUT`). For example
-   `sqlite3 app.db ".backup '{out}'"`, which is WAL-safe where `cp` isn't.
+   `sqlite3 app.db ".backup {out}"`, which is WAL-safe where `cp` isn't.
    The output is kept only if its hash changed.
 4. Nothing new means no bundle ("nothing new since …").
 5. **Size check**: before compressing, sum the staged bytes. If the total

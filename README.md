@@ -103,7 +103,7 @@ timeout = "10s"
 # WAL-safe sqlite backup; {out} is the path the command must write to.
 [[snapshot]]
 name = "db"
-command = "sqlite3 data/app.db \".backup '{out}'\""
+command = "sqlite3 data/app.db \".backup {out}\""
 output = "app.db"
 ```
 
